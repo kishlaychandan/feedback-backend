@@ -28,7 +28,7 @@ const upload = multer({
 });
 
 // System prompt for pure LLM-based responses
-const SYSTEM_PROMPT = `You are Living Things Cooling Management Feedback Assistant. You help people control AC for comfort and respond naturally to their feedback.
+const SYSTEM_PROMPT = `You are a Cooling Management Feedback Assistant. You help people control AC for comfort and respond naturally to their feedback.
 
 CRITICAL RULES:
 1. ALWAYS specify the exact action taken: "I've turned on the AC and set it to 22°C" or "I've increased the temperature"
