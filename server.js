@@ -27,33 +27,29 @@ const upload = multer({
   limits: { fileSize: 10 * 1024 * 1024 } // 10MB limit
 });
 
-// System prompt for pure LLM-based responses
-const SYSTEM_PROMPT = `You are a Cooling Management Feedback Assistant. You help people control AC for comfort and respond naturally to their feedback.
+// System prompt (pure LLM). Keep it short but strict.
+const SYSTEM_PROMPT = `You are **Living Things Cooling Management Feedback Assistant**.
+Goal: help people feel comfortable by controlling an AC unit based on their feedback (any language: English/Hindi/etc.).
 
-CRITICAL RULES:
-1. ALWAYS specify the exact action taken: "I've turned on the AC and set it to 22°C" or "I've increased the temperature"
-2. NEVER use generic phrases like "feedback has been noted" or "appropriate action has been taken"
-3. Show genuine empathy, especially for health issues or discomfort
-4. Keep responses concise (1-3 sentences), natural, and conversational
-5. Understand intent in ANY language (English, Hindi, etc.)
+Hard rules (must follow):
+- Your reply MUST include a concrete AC action AND a number: either a target temperature like "set to 22°C" OR a change like "decreased by 2°C".
+- NEVER say: "feedback noted", "appropriate action taken", "I understand your concern" (unless followed by the exact action).
+- Keep it natural and helpful in 1–3 short sentences. Reply in the user's language.
+- If user is sick (fever/बीमार/बुखार), show empathy + wish recovery + action.
 
-INTENT UNDERSTANDING:
-- Cold/freezing/ठंड/ठंडी → Increase temperature + Turn AC off
-- Hot/sweaty/sweating/गर्म/गर्मी → Turn AC on + Lower temperature
-- Fever/sick/बुखार/बीमार → Turn AC on + Lower temperature + Show empathy + Wish recovery
-- "set 24" / "24 degrees" → Set temperature to 24°C
-- "increase/warmer/बढ़ाओ" → Increase temperature
-- "decrease/cooler/कम करो/tapman kam kar do" → Decrease temperature
-- "turn on/चालू करो" → Turn AC on
-- "turn off/बंद करो" → Turn AC off
+Defaults when user gives no number:
+- If too hot/sweaty/गर्मी: turn AC ON and set to 22°C.
+- If too cold/ठंड: turn AC OFF and set to 26°C.
+- If user says "increase/decrease" without a number: change by 2°C (say "+2°C" or "-2°C").
 
-EXAMPLES:
-- "I'm feeling sweaty" → "I understand you're feeling sweaty. I've turned on the AC and lowered the temperature to 22°C to help you cool down."
-- "I have fever" → "I'm sorry you're not feeling well. I've turned on the AC and set it to 22°C. I hope you recover soon."
-- "Mujhe Thandi lag rahi hai" → "I understand you're feeling cold. I've increased the temperature and turned off the AC to warm things up."
-- "Set temperature to 24" → "Done! I've set the temperature to 24°C. The room will adjust to that setting."
+Intent hints:
+- cold/freezing/ठंड/ठंडी → warmer (AC OFF + 26°C or +2°C)
+- hot/sweaty/गर्म/गर्मी → cooler (AC ON + 22°C or -2°C)
+- "set 24"/"24 degrees" → set to 24°C
+- "turn on/चालू" → ON (also include a temperature, pick 22°C unless user specifies)
+- "turn off/बंद" → OFF (also include a temperature, pick 26°C unless user specifies)
 
-Remember: Always specify what you did. Be empathetic and natural. Understand intent in any language.`;
+Output: plain text only (no JSON, no markdown).`;
 
 // Pure LLM-based response generator
 async function generateResponse(userMessage) {
@@ -62,11 +58,13 @@ async function generateResponse(userMessage) {
       model: GEMINI_MODEL_TEXT,
       systemInstruction: SYSTEM_PROMPT,
       generationConfig: {
-        temperature: 0.7,
-        maxOutputTokens: 120
-      }
+        temperature: 0.4,
+        topK: 40,
+        topP: 0.9,
+        maxOutputTokens: 140,
+      },
     });
-
+                                                          
     const result = await model.generateContent(userMessage);
     const response = await result.response;
     const text = response.text();
@@ -75,20 +73,20 @@ async function generateResponse(userMessage) {
       return text.trim();
     }
 
-    // If no text returned, return simple message
-    return "I understand your request. I've adjusted the AC settings to help you feel more comfortable.";
+    // If no text returned, fail without pretending an action happened.
+    throw new Error('Empty response from Gemini');
 
   } catch (error) {
     console.error('Gemini API error:', error.message);
-    // Pure LLM approach - if API fails, return simple message
-    return "I understand your request. I've adjusted the AC settings to help you feel more comfortable.";
+    // Pure LLM approach - if API fails, don't fabricate AC actions.
+    return "Sorry—I'm having trouble responding right now. Please try again in a moment.";
   }
 }
 
 // API endpoint to process feedback
 app.post('/api/feedback', async (req, res) => {
   try {
-    const { message } = req.body;
+    const { message, acId } = req.body;
 
     if (!message || typeof message !== 'string' || message.trim().length === 0) {
       return res.status(400).json({ 
@@ -96,8 +94,10 @@ app.post('/api/feedback', async (req, res) => {
       });
     }
 
-    // Generate response using Gemini
-    const response = await generateResponse(message.trim());
+    // Generate response using Gemini (include AC context for better grounding)
+    const acContext = acId ? `AC ID: ${String(acId).slice(0, 64)}\n` : '';
+    const prompt = `${acContext}User message: ${message.trim()}`;
+    const response = await generateResponse(prompt);
 
     res.json({ 
       response: response,
