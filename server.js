@@ -33,9 +33,11 @@ Goal: help people feel comfortable by controlling an AC unit based on their feed
 
 Hard rules (must follow):
 - Your reply MUST include a concrete AC action AND a number: either a target temperature like "set to 22°C" OR a change like "decreased by 2°C".
+- If you mention a temperature, you MUST include the unit "°C" (e.g., "20°C"), and the reply must be a complete sentence (do not cut off mid-sentence).
 - NEVER say: "feedback noted", "appropriate action taken", "I understand your concern" (unless followed by the exact action).
 - Keep it natural and helpful in 1–3 short sentences. Reply in the user's language.
 - If user is sick (fever/बीमार/बुखार), show empathy + wish recovery + action.
+- If the user repeats discomfort ("still hot", "abhi bhi garmi", "still cold", "abhi bhi thand"), take an additional step (usually -2°C for hot, +2°C for cold) instead of repeating the same setting.
 
 Defaults when user gives no number:
 - If too hot/sweaty/गर्मी: turn AC ON and set to 22°C.
@@ -61,7 +63,7 @@ async function generateResponse(userMessage) {
         temperature: 0.4,
         topK: 40,
         topP: 0.9,
-        maxOutputTokens: 140,
+        maxOutputTokens: 200,
       },
     });
                                                           
@@ -86,7 +88,7 @@ async function generateResponse(userMessage) {
 // API endpoint to process feedback
 app.post('/api/feedback', async (req, res) => {
   try {
-    const { message, acId } = req.body;
+    const { message, acId, history } = req.body;
 
     if (!message || typeof message !== 'string' || message.trim().length === 0) {
       return res.status(400).json({ 
@@ -94,9 +96,24 @@ app.post('/api/feedback', async (req, res) => {
       });
     }
 
-    // Generate response using Gemini (include AC context for better grounding)
+    // Generate response using Gemini (include AC context + short chat history for follow-ups)
     const acContext = acId ? `AC ID: ${String(acId).slice(0, 64)}\n` : '';
-    const prompt = `${acContext}User message: ${message.trim()}`;
+    const historyLines = Array.isArray(history)
+      ? history
+          .slice(-10)
+          .map((m) => {
+            const role = m?.role === 'assistant' ? 'Assistant' : 'User';
+            const text = typeof m?.text === 'string' ? m.text : '';
+            return `${role}: ${text.replace(/\s+/g, ' ').trim().slice(0, 500)}`;
+          })
+          .filter(Boolean)
+          .join('\n')
+      : '';
+
+    const prompt =
+      `${acContext}` +
+      (historyLines ? `Conversation so far:\n${historyLines}\n\n` : '') +
+      `Latest user message: ${message.trim()}`;
     const response = await generateResponse(prompt);
 
     res.json({ 
