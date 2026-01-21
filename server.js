@@ -67,7 +67,7 @@ async function generateResponse(userMessage) {
                                                           
     const result = await model.generateContent(userMessage);
     const response = await result.response;
-    const text = response.text();
+    const text = response.text();     
 
     if (text && text.trim().length > 0) {
       return text.trim();
