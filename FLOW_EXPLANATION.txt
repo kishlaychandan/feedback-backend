@@ -1,0 +1,370 @@
+================================================================================
+FEEDBACK BACKEND - TEXT PROCESSING FLOW
+================================================================================
+
+This document explains step-by-step how text from frontend flows through the backend.
+
+================================================================================
+STEP 1: FETCH TEXT FROM FRONTEND
+================================================================================
+
+File: feedback-backend/controllers/feedback.controller.js
+Line: 37-39
+
+CODE BLOCK:
+-----------
+async function postFeedback(req, res) {
+  const requestId = req.requestId || Date.now().toString(36);
+  const { message, zoneId, acId, sessionId, history } = req.body || {};
+  //                    ^^^^^^^^
+  //                    THIS IS WHERE WE GET TEXT FROM FRONTEND
+-----------
+
+WHAT HAPPENS:
+- Frontend sends POST request to /api/feedback
+- Request body contains: { message: "I am feeling hot", zoneId: "1", sessionId: "abc123", history: [...] }
+- We extract 'message' from req.body - THIS IS THE USER TEXT
+
+
+================================================================================
+STEP 2: NORMALIZE AND VALIDATE TEXT
+================================================================================
+
+File: feedback-backend/controllers/feedback.controller.js
+Line: 41-46
+
+CODE BLOCK:
+-----------
+  const deviceId = normalizeZoneId(zoneId, acId);
+  const sId = normalizeSessionId(sessionId) || `anon_${(req.ip || 'ip').replace(/[^a-zA-Z0-9]/g, '').slice(0, 20)}`;
+  const msg = normalizeMessage(message);
+  //          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  //          CLEAN AND TRIM THE TEXT
+
+  if (!deviceId) return res.status(400).json({ error: 'zoneId is required' });
+  if (!msg) return res.status(400).json({ error: 'message is required' });
+-----------
+
+WHAT HAPPENS:
+- normalizeMessage() trims whitespace, limits to 2000 chars
+- Validate that zoneId and message exist
+- If missing, return 400 error
+
+
+================================================================================
+STEP 3: BUILD PROMPT FOR GEMINI (INTENT CLASSIFICATION)
+================================================================================
+
+File: feedback-backend/controllers/feedback.controller.js
+Line: 60-68
+
+CODE BLOCK:
+-----------
+  // Build prompt with history context
+  const normalizedHistory = normalizeHistory(history);
+  const historyText = normalizedHistory
+    .map((m) => `${m.role === 'assistant' ? 'Assistant' : 'User'}: ${m.text}`)
+    .join('\n');
+
+  const prompt = `Zone ID: ${deviceId}\n` +
+    (historyText ? `Conversation so far:\n${historyText}\n\n` : '') +
+    `Latest user message: ${msg}`;
+  //                        ^^^
+  //                        USER TEXT IS INCLUDED IN PROMPT
+-----------
+
+WHAT HAPPENS:
+- Combine zoneId, conversation history, and user message into a prompt
+- Example prompt:
+  "Zone ID: 1
+   Conversation so far:
+   User: Hello
+   Assistant: Hi, how can I help?
+   
+   Latest user message: I am feeling hot"
+
+
+================================================================================
+STEP 4: SEND TEXT TO GEMINI FOR INTENT CLASSIFICATION
+================================================================================
+
+File: feedback-backend/controllers/feedback.controller.js
+Line: 77-99
+
+CODE BLOCK:
+-----------
+  let structured;
+  try {
+    structured = await classifyIntentAndAction(prompt, deviceId);
+    //           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    //           SEND PROMPT TO GEMINI API
+  } catch (err) {
+    // Fallback to rules, but still report Gemini error
+    llm.ok = false;
+    llm.usedFallback = true;
+    llm.reason = err?.status === 429 ? 'RATE_LIMIT' : (err?.status === 504 ? 'TIMEOUT' : 'ERROR');
+    ...
+    structured = classifyIntentAndActionFallback(msg);
+  }
+-----------
+
+WHAT HAPPENS:
+- Call Gemini API with the prompt
+- Gemini returns JSON like: { "intent": "FEEDBACK", "requiresAction": true, "action": { "power": "ON", "deltaC": -2 } }
+- If Gemini fails (rate limit/timeout), use rule-based fallback
+
+
+================================================================================
+STEP 5: READ CURRENT STATE FROM DATABASE
+================================================================================
+
+File: feedback-backend/controllers/feedback.controller.js
+Line: 106-136
+
+CODE BLOCK:
+-----------
+  // Step 1: Read current state from DB
+  const resolved = await findDeviceByZoneId(deviceId);
+  const device = resolved.device;
+  const macId = resolved.macId;
+  
+  if (!device) {
+    return res.status(404).json({
+      error: `Device not found for zoneId: ${deviceId}`,
+      zoneId: deviceId,
+      sessionId: sId,
+    });
+  }
+
+  const port = await getPrimaryPortForDevice(device);
+  if (!port) {
+    return res.status(404).json({
+      error: `Port not found for device: ${deviceId}`,
+      zoneId: deviceId,
+      sessionId: sId,
+    });
+  }
+
+  const currentTelemetry = readTelemetry(deviceId, device, port);
+  //                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  //                        GET CURRENT POWER, SETPOINT, TEMP FROM DB
+-----------
+
+WHAT HAPPENS:
+- Find device in MongoDB by zoneId
+- Get the primary port for that device
+- Read current telemetry: { power: "ON", setpointC: 24, roomTempC: 26, ... }
+
+
+================================================================================
+STEP 6: PERFORM ACTION (GET DATA OR UPDATE STATE)
+================================================================================
+
+File: feedback-backend/controllers/feedback.controller.js
+Line: 138-182
+
+CODE BLOCK:
+-----------
+  // Step 2: Based on intent classification, perform action
+  let readData = null;
+  let computed = null;
+
+  // GET intents: Return data from DB
+  if (intent === 'GET_SETPOINT') {
+    readData = { power: currentTelemetry.power, setpointC: currentTelemetry.setpointC, lastUpdateAt: currentTelemetry.lastUpdateAt };
+    logWithTimestamp('DATA', `[${requestId}] GET_SETPOINT - returning data`, readData);
+  } else if (intent === 'GET_ROOM_TEMPERATURE') {
+    readData = { roomTempC: currentTelemetry.roomTempC, lastUpdateAt: currentTelemetry.lastUpdateAt };
+    ...
+  } 
+  // UPDATE/FEEDBACK intents: Compare DB state with desired, publish MQTT if change needed
+  else if (requiresAction && action) {
+    try {
+      computed = await computeAndMaybeApplyAction(deviceId, action, device, port, macId);
+      //         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      //         COMPARE CURRENT STATE WITH DESIRED STATE, PUBLISH MQTT IF NEEDED
+      logWithTimestamp('DATA', `[${requestId}] UPDATE action - compared and published`, {
+        current: computed.current,
+        next: computed.next,
+        mqttPublished: computed.mqtt?.published || false,
+        changed: computed.changed,
+        validation: computed.validation,
+      });
+    } catch (err) {
+      ...
+    }
+  }
+-----------
+
+WHAT HAPPENS:
+- If intent is GET_*: Just return data from DB (readData)
+- If intent is FEEDBACK/UPDATE: 
+  - Compare current DB state with desired action
+  - If different, publish MQTT command to change device state
+  - Store result in 'computed' object with current/next state and MQTT status
+
+
+================================================================================
+STEP 7: BUILD RESPONSE CONTEXT WITH COMPUTED TELEMETRY
+================================================================================
+
+File: feedback-backend/controllers/feedback.controller.js
+Line: 184-206
+
+CODE BLOCK:
+-----------
+  // Build response context with state change information
+  let stateChangeInfo = '';
+  if (computed) {
+    if (!computed.changed) {
+      stateChangeInfo = `\nIMPORTANT: The desired state already matches the current state. Inform the user that it's already set correctly (e.g., "The AC is already set to ${computed.next.setpointC}°C" or "The AC is already ${computed.next.power.toLowerCase()}").`;
+    } else {
+      stateChangeInfo = `\nState changed: ${JSON.stringify(computed.changes)}. MQTT published: ${computed.mqtt?.published || false}.`;
+    }
+    if (computed.validation?.clamped) {
+      stateChangeInfo += `\nNote: Action values were clamped to safe ranges (16-30°C).`;
+    }
+  }
+
+  const responseContext =
+    `Zone ID: ${deviceId}\n` +
+    `User message: ${message.trim()}\n` +
+    `Intent: ${intent}\n` +
+    `requiresAction: ${requiresAction}\n` +
+    (action ? `Action decided: ${JSON.stringify(action)}\n` : '') +
+    (readData ? `Read data: ${JSON.stringify(readData)}\n` : '') +
+    (computed ? `Computed change: ${JSON.stringify(computed)}\n` : '') +
+    //         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    //         COMPUTED TELEMETRY IS INCLUDED HERE
+    stateChangeInfo +
+    `\nReply to the user now.`;
+-----------
+
+WHAT HAPPENS:
+- Build a detailed context string that includes:
+  - User's original message
+  - Intent classification result
+  - Action decided by Gemini
+  - readData (for GET intents) OR computed (for UPDATE intents)
+  - State change information
+- This context will be sent to Gemini to generate the final response
+
+
+================================================================================
+STEP 8: SEND COMPUTED TELEMETRY TO GEMINI FOR FINAL RESPONSE
+================================================================================
+
+File: feedback-backend/controllers/feedback.controller.js
+Line: 208-235
+
+CODE BLOCK:
+-----------
+  let responseText;
+  // If we already fell back due to LLM classification failure, do not call LLM again.
+  if (llm.usedFallback) {
+    responseText = generateFinalResponseFallback({ message: msg, intent, readData, computed, llmWarning: true });
+  } else {
+    try {
+      responseText = await generateFinalResponse(responseContext, deviceId);
+      //             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      //             SEND RESPONSE CONTEXT (WITH COMPUTED TELEMETRY) TO GEMINI
+    } catch (err) {
+      // Fallback to rules, but still report Gemini error
+      llm.ok = false;
+      llm.usedFallback = true;
+      ...
+      responseText = generateFinalResponseFallback({ message: msg, intent, readData, computed, llmWarning: true });
+    }
+  }
+-----------
+
+WHAT HAPPENS:
+- Send responseContext (which includes computed telemetry) to Gemini
+- Gemini generates a natural language response like: "Done. AC turned on and set to 22°C."
+- If Gemini fails, use rule-based fallback
+
+
+================================================================================
+STEP 9: RETURN RESPONSE TO FRONTEND
+================================================================================
+
+File: feedback-backend/controllers/feedback.controller.js
+Line: 250-263
+
+CODE BLOCK:
+-----------
+  res.json({
+    response: responseText,
+    //        ^^^^^^^^^^^^^^
+    //        GEMINI'S FINAL RESPONSE TEXT
+    originalMessage: message,
+    zoneId: deviceId,
+    sessionId: sId,
+    macId,
+    intent,
+    requiresAction,
+    action,
+    readData,
+    computed,
+    chatStored: CHAT_WRITES_ENABLED,
+    llm,
+  });
+-----------
+
+WHAT HAPPENS:
+- Return JSON response to frontend with:
+  - response: The final text from Gemini (e.g., "Done. AC turned on and set to 22°C.")
+  - computed: The telemetry comparison and MQTT publish status
+  - readData: The data read from DB (for GET intents)
+  - llm: Status of Gemini calls (success or fallback)
+
+
+================================================================================
+SUMMARY FLOW DIAGRAM
+================================================================================
+
+Frontend sends text
+    ↓
+[STEP 1] Extract message from req.body (Line 39)
+    ↓
+[STEP 2] Normalize and validate (Line 43)
+    ↓
+[STEP 3] Build prompt with history (Line 66-68)
+    ↓
+[STEP 4] Send to Gemini for intent classification (Line 79)
+    ↓
+[STEP 5] Read current state from DB (Line 128)
+    ↓
+[STEP 6] Perform action (GET data OR compute & publish MQTT) (Line 142-182)
+    ↓
+[STEP 7] Build response context with computed telemetry (Line 197-206)
+    ↓
+[STEP 8] Send computed telemetry to Gemini for final response (Line 214)
+    ↓
+[STEP 9] Return response to frontend (Line 250-263)
+
+
+================================================================================
+KEY FILES AND FUNCTIONS
+================================================================================
+
+1. Text from frontend:
+   - File: controllers/feedback.controller.js
+   - Line: 39
+   - Code: const { message, ... } = req.body || {};
+
+2. Text to Gemini (intent):
+   - File: controllers/feedback.controller.js
+   - Line: 79
+   - Code: structured = await classifyIntentAndAction(prompt, deviceId);
+   - Function: services/gemini.service.js -> classifyIntentAndAction()
+
+3. Computed telemetry to Gemini (response):
+   - File: controllers/feedback.controller.js
+   - Line: 214
+   - Code: responseText = await generateFinalResponse(responseContext, deviceId);
+   - Function: services/gemini.service.js -> generateFinalResponse()
+   - responseContext includes: computed (Line 204), readData (Line 203), action (Line 202)
+
+================================================================================
+

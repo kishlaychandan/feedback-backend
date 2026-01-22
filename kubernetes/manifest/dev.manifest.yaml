@@ -1,0 +1,93 @@
+apiVersion: v1
+data:
+  CHAT_WRITES_ENABLED: "false"
+  DB_WRITES_ENABLED: "false"
+  FEEDBACK_MONGO_URI: mongodb://mongo-new-mongodb-0.mongo-new-mongodb-headless.mongo.svc.cluster.local:27017/lightson_dev_sku_replacement?directConnection=true
+  GEMINI_API_KEY: AIzaSyATn5rK747yI5nqUQi6QRTP0BMDspZTyA4
+  GEMINI_MODEL_TEXT: gemini-2.5-flash
+  MQTT_URL: mqtt://mqtt.livingthings.dev:1883
+  PORT: "3001"
+kind: ConfigMap
+metadata:
+  annotations:
+    generated: "false"
+  name: feedback-backend-env-file
+  namespace: backend
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: feedback-backend-service
+  namespace: backend
+spec:
+  ports:
+  - name: http
+    port: 3001
+    targetPort: 3001
+  selector:
+    app: feedback-backend-deployment
+  type: NodePort
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  labels:
+    app.kubernetes.io/instance: feedback-backend
+  name: feedback-backend-deployment
+  namespace: backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: feedback-backend-deployment
+  template:
+    metadata:
+      labels:
+        app: feedback-backend-deployment
+    spec:
+      containers:
+      - envFrom:
+        - configMapRef:
+            name: feedback-backend-env-file
+        image: ltorg.azurecr.io/cmp/feedback-backend:v1.0.4
+        imagePullPolicy: IfNotPresent
+        name: feedback-backend
+        ports:
+        - containerPort: 3001
+          name: http
+          protocol: TCP
+        resources:
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+          requests:
+            cpu: 10m
+            memory: 100Mi
+      nodeSelector:
+        Databases: Schedule
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: feedback-backend-deployment-hpa
+  namespace: backend
+spec:
+  maxReplicas: 1
+  metrics:
+  - resource:
+      name: cpu
+      target:
+        averageUtilization: 50
+        type: Utilization
+    type: Resource
+  - resource:
+      name: memory
+      target:
+        averageUtilization: 80
+        type: Utilization
+    type: Resource
+  minReplicas: 1
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: feedback-backend-deployment

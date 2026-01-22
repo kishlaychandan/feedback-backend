@@ -1,0 +1,51 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: feedback-backend-deployment
+  namespace: uat-backend
+  labels:
+    app.kubernetes.io/instance: feedback-backend
+spec:
+  # replicas: 1
+  selector:
+    matchLabels:
+      app: feedback-backend-deployment
+  template:
+    metadata:
+      labels:
+        app: feedback-backend-deployment
+    spec:
+      nodeSelector:
+        WebApplication: Schedule
+      containers:
+        - name: feedback-backend
+          image: ltorg.azurecr.io/cmp/feedback-backend:latest
+          imagePullPolicy: IfNotPresent
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 3001
+            initialDelaySeconds: 60
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 3001
+            initialDelaySeconds: 60
+            periodSeconds: 10
+          ports:
+            - name: http
+              containerPort: 3001
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: feedback-backend-env-file
+          resources:
+            limits:
+              cpu: 100m
+              memory: 500Mi
+            requests:
+              cpu: 100m
+              memory: 200Mi
+      # imagePullSecrets:
+      #   - name: feedback-backend-registry-credentials

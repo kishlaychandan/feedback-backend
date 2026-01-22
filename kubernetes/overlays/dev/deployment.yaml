@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: feedback-backend-deployment
+  namespace: backend
+  labels:
+    app.kubernetes.io/instance: feedback-backend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: feedback-backend-deployment
+  template:
+    metadata:
+      labels:
+        app: feedback-backend-deployment
+    spec:
+      nodeSelector:
+        Databases: Schedule
+      containers:
+        - name: feedback-backend
+          image: ltorg.azurecr.io/cmp/feedback-backend:v1.0.4
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 3001
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: feedback-backend-env-file
+          resources:
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+            requests:
+              cpu: 10m
+              memory: 100Mi
+      # imagePullSecrets:
+      #   - name: feedback-backend-registry-credentials
